@@ -28,6 +28,9 @@ public final class UPlayerWarmPathSession: NSObject {
 
     private let lock = NSLock()
     private var pendingCompletions: [URL: [(Bool) -> Void]] = [:]
+    private var reservationStartTimes: [URL: Date] = [:]
+    private var cacheHits = 0
+    private var cacheMisses = 0
 
     public init(lookaheadCount: Int = UPlayerWarmPathSession.defaultLookaheadCount,
                 fragmentCache: UPlayerFragmentCache = .shared,
@@ -64,14 +67,19 @@ public final class UPlayerWarmPathSession: NSObject {
         lock.lock()
         let alreadyInFlight = pendingCompletions[url] != nil
         pendingCompletions[url, default: []].append(completion ?? { _ in })
+        if !alreadyInFlight {
+            reservationStartTimes[url] = Date()
+        }
         lock.unlock()
 
         guard !alreadyInFlight else {
             log("[warmpath] reserve already in flight for \(url.absoluteString)", loggingLevel: .debug)
+            NSLog("[UPlayerWarmPath][session] DEDUP-SKIP ts=%f url=%@", Date().timeIntervalSince1970, url.absoluteString)
             return
         }
 
         log("[warmpath] reserving \(url.absoluteString)", loggingLevel: .info)
+        NSLog("[UPlayerWarmPath][session] RESERVE ts=%f url=%@", Date().timeIntervalSince1970, url.absoluteString)
 
         let asset = UPlayerAsset(url: url)
         processorsQueue.start(asset: asset)
@@ -86,6 +94,7 @@ public final class UPlayerWarmPathSession: NSObject {
         lock.lock()
         let pending = pendingCompletions
         pendingCompletions.removeAll()
+        reservationStartTimes.removeAll()
         lock.unlock()
 
         pending.values.flatMap { $0 }.forEach { $0(false) }
@@ -94,12 +103,39 @@ public final class UPlayerWarmPathSession: NSObject {
     private func completePending(for url: URL, success: Bool) {
         lock.lock()
         let completions = pendingCompletions.removeValue(forKey: url) ?? []
+        let startTime = reservationStartTimes.removeValue(forKey: url)
         lock.unlock()
+
+        if let startTime {
+            let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
+            NSLog("[UPlayerWarmPath][session] FINISHED ts=%f url=%@ outcome=%@ durationMs=%d",
+                  Date().timeIntervalSince1970, url.absoluteString, success ? "ready" : "failed", durationMs)
+        }
 
         completions.forEach { $0(success) }
     }
 
+    private func recordCacheLookup(hit: Bool, url: URL) {
+        lock.lock()
+        if hit { cacheHits += 1 } else { cacheMisses += 1 }
+        let hits = cacheHits
+        let misses = cacheMisses
+        lock.unlock()
+        let total = hits + misses
+        let rate = total > 0 ? Double(hits) / Double(total) * 100.0 : 0
+        NSLog("[UPlayerWarmPath][cache] %@ url=%@ hitRate=%.1f%% (%d/%d)",
+              hit ? "HIT" : "MISS", url.lastPathComponent, rate, hits, total)
+    }
+
     private func prefetchFragments(from asset: UPlayerAssetProtocol) {
+        lock.lock()
+        let manifestStart = reservationStartTimes[asset.url]
+        lock.unlock()
+        if let manifestStart {
+            NSLog("[UPlayerWarmPath][stage] manifest url=%@ durationMs=%d",
+                  asset.url.absoluteString, Int(Date().timeIntervalSince(manifestStart) * 1000))
+        }
+
         guard let hlsMetadata = asset.hlsMetadata else {
             completePending(for: asset.url, success: false)
             return
@@ -118,13 +154,16 @@ public final class UPlayerWarmPathSession: NSObject {
 
         completePending(for: asset.url, success: true)
 
+        let fragmentsStart = Date()
         Task { [urlSession, fragmentCache] in
             await withTaskGroup(of: Void.self) { group in
                 for realURL in candidateURLs {
                     group.addTask {
                         if fragmentCache.data(for: realURL) != nil {
+                            self.recordCacheLookup(hit: true, url: realURL)
                             return
                         }
+                        self.recordCacheLookup(hit: false, url: realURL)
 
                         do {
                             let (data, response) = try await urlSession.data(from: realURL)
@@ -142,6 +181,8 @@ public final class UPlayerWarmPathSession: NSObject {
                     }
                 }
             }
+            NSLog("[UPlayerWarmPath][stage] fragments url=%@ count=%d durationMs=%d",
+                  asset.url.absoluteString, candidateURLs.count, Int(Date().timeIntervalSince(fragmentsStart) * 1000))
         }
     }
 
@@ -201,8 +242,11 @@ extension UPlayerWarmPathSession: UPlayerAssetProcessorsQueueDelegate {
         lock.lock()
         let pending = pendingCompletions
         pendingCompletions.removeAll()
+        reservationStartTimes.removeAll()
         lock.unlock()
 
+        NSLog("[UPlayerWarmPath][session] PROCESSING-FAILED ts=%f error=%@",
+              Date().timeIntervalSince1970, String(describing: error))
         pending.values.flatMap { $0 }.forEach { $0(false) }
     }
 
