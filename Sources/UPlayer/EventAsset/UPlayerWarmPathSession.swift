@@ -6,9 +6,10 @@
 //  (wyze-wpk-ios, feat/kvs-prefetch-caching). Given the next likely
 //  event's URL, this parses its manifest (via the same processor
 //  pipeline used for normal playback) and concurrently prefetches the
-//  video init segment plus the next N media fragments into
-//  `UPlayerFragmentCache`, so `UPlayerAVAssetResourceLoader` can serve
-//  them from disk instead of the network once the user actually swipes.
+//  video+audio init segments plus the next N media fragments (both
+//  tracks) into `UPlayerFragmentCache`, so `UPlayerAVAssetResourceLoader`
+//  can serve them from disk instead of the network once the user
+//  actually swipes.
 //
 
 import Foundation
@@ -54,9 +55,10 @@ public final class UPlayerWarmPathSession: NSObject {
     }
 
     /// Begins prefetching `url`'s manifest and its first `lookaheadCount`
-    /// video fragments. Safe to call multiple times for the same URL
-    /// while a prefetch is already in flight — the completion is simply
-    /// appended to the pending set instead of starting duplicate work.
+    /// media fragments (video and audio tracks). Safe to call multiple
+    /// times for the same URL while a prefetch is already in flight — the
+    /// completion is simply appended to the pending set instead of
+    /// starting duplicate work.
     ///
     /// `completion` reports `true` if at least the manifest was parsed
     /// and some fragments were queued for (or already) caching; `false` on
@@ -147,7 +149,7 @@ public final class UPlayerWarmPathSession: NSObject {
         )
 
         guard !candidateURLs.isEmpty else {
-            log("[warmpath] no video fragment URLs found for \(asset.url.absoluteString)", loggingLevel: .debug)
+            log("[warmpath] no media fragment URLs found for \(asset.url.absoluteString)", loggingLevel: .debug)
             completePending(for: asset.url, success: true)
             return
         }
@@ -186,12 +188,15 @@ public final class UPlayerWarmPathSession: NSObject {
         }
     }
 
-    /// Parses raw HLS media-playlist text for `uplayer://` video
+    /// Parses raw HLS media-playlist text for `uplayer://` video/audio
     /// init/segment URIs (the `EXT-X-MAP` line, plus up to
     /// `lookaheadCount` following `EXTINF` media URIs) and recovers their
     /// original `https://` URL — the same key `UPlayerAVAssetResourceLoader`
     /// will look up when the segment is actually requested during
-    /// playback.
+    /// playback. Covers both tracks: AVPlayer needs both video and audio
+    /// data to reach `readyToPlay`, so warming video alone left audio as a
+    /// live network fetch that gated readiness regardless of how warm the
+    /// video track was.
     static func videoFragmentURLs<S: Sequence>(in playlists: S, lookaheadCount: Int) -> [URL] where S.Element == String {
         var results: [URL] = []
 
@@ -220,7 +225,7 @@ public final class UPlayerWarmPathSession: NSObject {
                       let url = URL(string: uriString),
                       url.scheme == "uplayer",
                       let mode = UPlayerURLScheme.mode(of: url),
-                      mode == "video-segment" || mode == "video-init",
+                      ["video-segment", "video-init", "audio-transcode", "audio-transcode-init"].contains(mode),
                       let originalURL = UPlayerURLScheme.originalHTTPURL(from: url) else {
                     continue
                 }
