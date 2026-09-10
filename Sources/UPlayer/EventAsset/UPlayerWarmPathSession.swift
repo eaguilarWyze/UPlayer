@@ -33,6 +33,27 @@ public final class UPlayerWarmPathSession: NSObject {
     private var cacheHits = 0
     private var cacheMisses = 0
 
+    /// The outer fragment-fetch `Task` for each asset (manifest) URL
+    /// currently prefetching. Stored so `endSession()` can actually cancel
+    /// in-flight network fetches, not just stop manifest parsing —
+    /// previously a bare untracked `Task` here meant leaving a screen
+    /// mid-prefetch never stopped the fragment downloads it kicked off.
+    /// `URLSession`'s async `data(from:)` cancels its underlying
+    /// `URLSessionTask` when the enclosing `Task` is cancelled, so
+    /// cancelling this handle is sufficient — no separate download-task
+    /// bookkeeping is needed.
+    private var fetchTasks: [URL: Task<Void, Never>] = [:]
+
+    /// Caps real fragment-fetch concurrency across ALL in-flight
+    /// prefetches (every event being warmed at once), not just the
+    /// resolve-call batching callers may do above this session. AWS KVS
+    /// enforces a hard 3-concurrent-connection-per-stream-per-host limit
+    /// shared by manifest/fragment/init fetches; without this, group-wide
+    /// prefetching (multiple events' fragments overlapping freely) starves
+    /// that shared budget and can stall whichever event is actively
+    /// playing.
+    private let fetchThrottle = UPlayerFetchThrottle(limit: 3)
+
     public init(lookaheadCount: Int = UPlayerWarmPathSession.defaultLookaheadCount,
                 fragmentCache: UPlayerFragmentCache = .shared,
                 urlSession: URLSession = .shared) {
@@ -97,7 +118,14 @@ public final class UPlayerWarmPathSession: NSObject {
         let pending = pendingCompletions
         pendingCompletions.removeAll()
         reservationStartTimes.removeAll()
+        let tasks = fetchTasks
+        fetchTasks.removeAll()
         lock.unlock()
+
+        // Actually stop the in-flight fragment downloads, not just manifest
+        // parsing — `URLSession.data(from:)` cancels its underlying network
+        // request when the enclosing `Task` is cancelled.
+        tasks.values.forEach { $0.cancel() }
 
         pending.values.flatMap { $0 }.forEach { $0(false) }
     }
@@ -157,21 +185,35 @@ public final class UPlayerWarmPathSession: NSObject {
         completePending(for: asset.url, success: true)
 
         let fragmentsStart = Date()
-        Task { [urlSession, fragmentCache] in
+        let assetURL = asset.url
+        let task = Task { [urlSession, fragmentCache, fetchThrottle] in
             await withTaskGroup(of: Void.self) { group in
                 for realURL in candidateURLs {
                     group.addTask {
+                        if Task.isCancelled { return }
+
                         if fragmentCache.data(for: realURL) != nil {
                             self.recordCacheLookup(hit: true, url: realURL)
                             return
                         }
                         self.recordCacheLookup(hit: false, url: realURL)
 
+                        // Cross-event cap: only `limit` fragment downloads run
+                        // at once across every prefetch this session has in
+                        // flight, matching KVS's per-host connection budget.
+                        await fetchThrottle.acquire()
+
+                        if Task.isCancelled {
+                            await fetchThrottle.release()
+                            return
+                        }
+
                         do {
                             let (data, response) = try await urlSession.data(from: realURL)
 
                             guard let http = response as? HTTPURLResponse,
                                   (200...299).contains(http.statusCode) else {
+                                await fetchThrottle.release()
                                 return
                             }
 
@@ -180,12 +222,21 @@ public final class UPlayerWarmPathSession: NSObject {
                         } catch {
                             log("[warmpath] prefetch failed for \(realURL.absoluteString): \(error)", loggingLevel: .error)
                         }
+                        await fetchThrottle.release()
                     }
                 }
             }
             NSLog("[UPlayerWarmPath][stage] fragments url=%@ count=%d durationMs=%d",
-                  asset.url.absoluteString, candidateURLs.count, Int(Date().timeIntervalSince(fragmentsStart) * 1000))
+                  assetURL.absoluteString, candidateURLs.count, Int(Date().timeIntervalSince(fragmentsStart) * 1000))
+
+            self.lock.lock()
+            self.fetchTasks.removeValue(forKey: assetURL)
+            self.lock.unlock()
         }
+
+        lock.lock()
+        fetchTasks[assetURL] = task
+        lock.unlock()
     }
 
     /// Parses raw HLS media-playlist text for `uplayer://` video/audio
@@ -235,6 +286,43 @@ public final class UPlayerWarmPathSession: NSObject {
         }
 
         return results
+    }
+}
+
+/// A simple counting semaphore for `async` code: at most `limit` callers
+/// hold the gate at once, others suspend on `acquire()` until a slot is
+/// `release()`d. Used to cap real fragment-fetch concurrency across every
+/// prefetch `UPlayerWarmPathSession` has in flight at once (not just within
+/// a single event's own fragment list), matching AWS KVS's documented
+/// hard 3-concurrent-connection-per-stream-per-host limit.
+private actor UPlayerFetchThrottle {
+    private let limit: Int
+    private var current = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func acquire() async {
+        if current < limit {
+            current += 1
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if !waiters.isEmpty {
+            // Hand the just-freed slot straight to the next waiter instead
+            // of decrementing `current` — it's still occupied, just by a
+            // different caller now.
+            waiters.removeFirst().resume()
+        } else {
+            current -= 1
+        }
     }
 }
 
